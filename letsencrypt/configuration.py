@@ -1,15 +1,17 @@
 """Let's Encrypt user-supplied configuration."""
+import copy
 import os
-import urlparse
-import re
 
+from six.moves.urllib import parse  # pylint: disable=import-error
 import zope.interface
 
 from letsencrypt import constants
 from letsencrypt import errors
 from letsencrypt import interfaces
+from letsencrypt import le_util
 
 
+@zope.interface.implementer(interfaces.IConfig)
 class NamespaceConfig(object):
     """Configuration wrapper around :class:`argparse.Namespace`.
 
@@ -31,7 +33,6 @@ class NamespaceConfig(object):
     :type namespace: :class:`argparse.Namespace`
 
     """
-    zope.interface.implements(interfaces.IConfig)
 
     def __init__(self, namespace):
         self.namespace = namespace
@@ -49,7 +50,7 @@ class NamespaceConfig(object):
     @property
     def server_path(self):
         """File path based on ``server``."""
-        parsed = urlparse.urlparse(self.namespace.server)
+        parsed = parse.urlparse(self.namespace.server)
         return (parsed.netloc + parsed.path).replace('/', os.path.sep)
 
     @property
@@ -77,6 +78,12 @@ class NamespaceConfig(object):
     def temp_checkpoint_dir(self):  # pylint: disable=missing-docstring
         return os.path.join(
             self.namespace.work_dir, constants.TEMP_CHECKPOINT_DIR)
+
+    def __deepcopy__(self, _memo):
+        # Work around https://bugs.python.org/issue1515 for py26 tests :( :(
+        # https://travis-ci.org/letsencrypt/letsencrypt/jobs/106900743#L3276
+        new_ns = copy.deepcopy(self.namespace)
+        return type(self)(new_ns)
 
 
 class RenewerConfiguration(object):
@@ -123,40 +130,6 @@ def check_config_sanity(config):
 
     # Domain checks
     if config.namespace.domains is not None:
-        _check_config_domain_sanity(config.namespace.domains)
-
-
-def _check_config_domain_sanity(domains):
-    """Helper method for check_config_sanity which validates
-    domain flag values and errors out if the requirements are not met.
-
-    :param domains: List of domains
-    :type domains: `list` of `string`
-    :raises ConfigurationError: for invalid domains and cases where Let's
-                                Encrypt currently will not issue certificates
-
-    """
-    # Check if there's a wildcard domain
-    if any(d.startswith("*.") for d in domains):
-        raise errors.ConfigurationError(
-            "Wildcard domains are not supported")
-    # Punycode
-    if any("xn--" in d for d in domains):
-        raise errors.ConfigurationError(
-            "Punycode domains are not supported")
-
-    # Unicode
-    try:
-        for domain in domains:
-            domain.encode('ascii')
-    except UnicodeDecodeError:
-        raise errors.ConfigurationError(
-            "Internationalized domain names are not supported")
-
-    # FQDN checks from
-    # http://www.mkyong.com/regular-expressions/domain-name-regular-expression-example/
-    #  Characters used, domain parts < 63 chars, tld > 1 < 64 chars
-    #  first and last char is not "-"
-    fqdn = re.compile("^((?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+[A-Za-z]{2,63}$")
-    if any(True for d in domains if not fqdn.match(d)):
-        raise errors.ConfigurationError("Requested domain is not a FQDN")
+        for domain in config.namespace.domains:
+            # This may be redundant, but let's be paranoid
+            le_util.enforce_domain_sanity(domain)

@@ -6,9 +6,13 @@ import logging
 import os
 import platform
 import re
+import six
+import socket
 import stat
 import subprocess
 import sys
+
+import configargparse
 
 from letsencrypt import errors
 
@@ -278,5 +282,63 @@ def add_deprecated_argument(add_argument, argument_name, nargs):
             sys.stderr.write(
                 "Use of {0} is deprecated.\n".format(option_string))
 
+    configargparse.ACTION_TYPES_THAT_DONT_NEED_A_VALUE.add(ShowWarning)
     add_argument(argument_name, action=ShowWarning,
                  help=argparse.SUPPRESS, nargs=nargs)
+
+
+def enforce_domain_sanity(domain):
+    """Method which validates domain value and errors out if
+    the requirements are not met.
+
+    :param domain: Domain to check
+    :type domains: `str` or `unicode`
+    :raises ConfigurationError: for invalid domains and cases where Let's
+                                Encrypt currently will not issue certificates
+
+    :returns: The domain cast to `str`, with ASCII-only contents
+    :rtype: str
+    """
+    # Check if there's a wildcard domain
+    if domain.startswith("*."):
+        raise errors.ConfigurationError(
+            "Wildcard domains are not supported: {0}".format(domain))
+    # Punycode
+    if "xn--" in domain:
+        raise errors.ConfigurationError(
+            "Punycode domains are not presently supported: {0}".format(domain))
+
+    # Unicode
+    try:
+        domain = domain.encode('ascii').lower()
+    except UnicodeError:
+        error_fmt = (u"Internationalized domain names "
+                      "are not presently supported: {0}")
+        if isinstance(domain, six.text_type):
+            raise errors.ConfigurationError(error_fmt.format(domain))
+        else:
+            raise errors.ConfigurationError(str(error_fmt).format(domain))
+
+    # Remove trailing dot
+    domain = domain[:-1] if domain.endswith('.') else domain
+
+    # Explain separately that IP addresses aren't allowed (apart from not
+    # being FQDNs) because hope springs eternal concerning this point
+    try:
+        socket.inet_aton(domain)
+        raise errors.ConfigurationError(
+            "Requested name {0} is an IP address. The Let's Encrypt "
+            "certificate authority will not issue certificates for a "
+            "bare IP address.".format(domain))
+    except socket.error:
+        # It wasn't an IP address, so that's good
+        pass
+
+    # FQDN checks from
+    # http://www.mkyong.com/regular-expressions/domain-name-regular-expression-example/
+    #  Characters used, domain parts < 63 chars, tld > 1 < 64 chars
+    #  first and last char is not "-"
+    fqdn = re.compile("^((?!-)[A-Za-z0-9-]{1,63}(?<!-)\\.)+[A-Za-z]{2,63}$")
+    if not fqdn.match(domain):
+        raise errors.ConfigurationError("Requested domain {0} is not a FQDN".format(domain))
+    return domain

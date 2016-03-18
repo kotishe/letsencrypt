@@ -2,9 +2,10 @@
 import errno
 import logging
 import os
-import stat
+from collections import defaultdict
 
 import zope.interface
+import six
 
 from acme import challenges
 
@@ -16,10 +17,10 @@ from letsencrypt.plugins import common
 logger = logging.getLogger(__name__)
 
 
+@zope.interface.implementer(interfaces.IAuthenticator)
+@zope.interface.provider(interfaces.IPluginFactory)
 class Authenticator(common.Plugin):
     """Webroot Authenticator."""
-    zope.interface.implements(interfaces.IAuthenticator)
-    zope.interface.classProvides(interfaces.IPluginFactory)
 
     description = "Webroot Authenticator"
 
@@ -45,13 +46,16 @@ to serve all files under specified web root ({0})."""
     def __init__(self, *args, **kwargs):
         super(Authenticator, self).__init__(*args, **kwargs)
         self.full_roots = {}
+        self.performed = defaultdict(set)
 
     def prepare(self):  # pylint: disable=missing-docstring
         path_map = self.conf("map")
 
         if not path_map:
-            raise errors.PluginError("--{0} must be set".format(
-                self.option_name("path")))
+            raise errors.PluginError(
+                "Missing parts of webroot configuration; please set either "
+                "--webroot-path and --domains, or --webroot-map. Run with "
+                " --help webroot for examples.")
         for name, path in path_map.items():
             if not os.path.isdir(path):
                 raise errors.PluginError(path + " does not exist or is not a directory")
@@ -59,59 +63,97 @@ to serve all files under specified web root ({0})."""
 
             logger.debug("Creating root challenges validation dir at %s",
                          self.full_roots[name])
+
+            # Change the permissions to be writable (GH #1389)
+            # Umask is used instead of chmod to ensure the client can also
+            # run as non-root (GH #1795)
+            old_umask = os.umask(0o022)
+
             try:
-                os.makedirs(self.full_roots[name])
-                # Set permissions as parent directory (GH #1389)
-                # We don't use the parameters in makedirs because it
-                # may not always work
+                # This is coupled with the "umask" call above because
+                # os.makedirs's "mode" parameter may not always work:
                 # https://stackoverflow.com/questions/5231901/permission-problems-when-creating-a-dir-with-os-makedirs-python
-                stat_path = os.stat(path)
-                filemode = stat.S_IMODE(stat_path.st_mode)
-                os.chmod(self.full_roots[name], filemode)
-                # Set owner and group, too
-                os.chown(self.full_roots[name], stat_path.st_uid,
-                          stat_path.st_gid)
+                os.makedirs(self.full_roots[name], 0o0755)
+
+                # Set owner as parent directory if possible
+                try:
+                    stat_path = os.stat(path)
+                    os.chown(self.full_roots[name], stat_path.st_uid,
+                             stat_path.st_gid)
+                except OSError as exception:
+                    if exception.errno == errno.EACCES:
+                        logger.debug("Insufficient permissions to change owner and uid - ignoring")
+                    else:
+                        raise errors.PluginError(
+                            "Couldn't create root for {0} http-01 "
+                            "challenge responses: {1}", name, exception)
 
             except OSError as exception:
                 if exception.errno != errno.EEXIST:
                     raise errors.PluginError(
                         "Couldn't create root for {0} http-01 "
                         "challenge responses: {1}", name, exception)
+            finally:
+                os.umask(old_umask)
 
     def perform(self, achalls):  # pylint: disable=missing-docstring
         assert self.full_roots, "Webroot plugin appears to be missing webroot map"
         return [self._perform_single(achall) for achall in achalls]
 
-    def _path_for_achall(self, achall):
+    def _get_root_path(self, achall):
         try:
             path = self.full_roots[achall.domain]
-        except IndexError:
-            raise errors.PluginError("Missing --webroot-path for domain: {1}"
-                        .format(achall.domain))
+        except KeyError:
+            raise errors.PluginError("Missing --webroot-path for domain: {0}"
+                                     .format(achall.domain))
         if not os.path.exists(path):
             raise errors.PluginError("Mysteriously missing path {0} for domain: {1}"
-                        .format(path, achall.domain))
-        return os.path.join(path, achall.chall.encode("token"))
+                                     .format(path, achall.domain))
+        return path
+
+    def _get_validation_path(self, root_path, achall):
+        return os.path.join(root_path, achall.chall.encode("token"))
 
     def _perform_single(self, achall):
         response, validation = achall.response_and_validation()
-        path = self._path_for_achall(achall)
-        logger.debug("Attempting to save validation to %s", path)
-        with open(path, "w") as validation_file:
-            validation_file.write(validation.encode())
 
-        # Set permissions as parent directory (GH #1389)
-        parent_path = self.full_roots[achall.domain]
-        stat_parent_path = os.stat(parent_path)
-        filemode = stat.S_IMODE(stat_parent_path.st_mode)
-        # Remove execution bit (not needed for this file)
-        os.chmod(path, filemode & ~stat.S_IEXEC)
-        os.chown(path, stat_parent_path.st_uid, stat_parent_path.st_gid)
+        root_path = self._get_root_path(achall)
+        validation_path = self._get_validation_path(root_path, achall)
+        logger.debug("Attempting to save validation to %s", validation_path)
+
+        # Change permissions to be world-readable, owner-writable (GH #1795)
+        old_umask = os.umask(0o022)
+
+        try:
+            with open(validation_path, "w") as validation_file:
+                validation_file.write(validation.encode())
+        finally:
+            os.umask(old_umask)
+
+        self.performed[root_path].add(achall)
 
         return response
 
     def cleanup(self, achalls):  # pylint: disable=missing-docstring
         for achall in achalls:
-            path = self._path_for_achall(achall)
-            logger.debug("Removing %s", path)
-            os.remove(path)
+            root_path = self._get_root_path(achall)
+            validation_path = self._get_validation_path(root_path, achall)
+            logger.debug("Removing %s", validation_path)
+            os.remove(validation_path)
+            self.performed[root_path].remove(achall)
+
+        for root_path, achalls in six.iteritems(self.performed):
+            if not achalls:
+                try:
+                    os.rmdir(root_path)
+                    logger.debug("All challenges cleaned up, removing %s",
+                                 root_path)
+                except OSError as exc:
+                    if exc.errno == errno.ENOTEMPTY:
+                        logger.debug("Challenges cleaned up but %s not empty",
+                                     root_path)
+                    elif exc.errno == errno.EACCES:
+                        logger.debug("Challenges cleaned up but no permissions for %s",
+                                     root_path)
+                    else:
+                        raise

@@ -1,11 +1,14 @@
 """A class that performs TLS-SNI-01 challenges for Apache"""
 
 import os
+import logging
 
 from letsencrypt.plugins import common
 
 from letsencrypt_apache import obj
 from letsencrypt_apache import parser
+
+logger = logging.getLogger(__name__)
 
 
 class ApacheTlsSni01(common.TLSSNI01):
@@ -50,7 +53,7 @@ class ApacheTlsSni01(common.TLSSNI01):
         super(ApacheTlsSni01, self).__init__(*args, **kwargs)
 
         self.challenge_conf = os.path.join(
-            self.configurator.conf("server-root"),
+            self.configurator.conf("challenge-location"),
             "le_tls_sni_01_cert_challenge.conf")
 
     def perform(self):
@@ -59,7 +62,7 @@ class ApacheTlsSni01(common.TLSSNI01):
             return []
         # Save any changes to the configuration as a precaution
         # About to make temporary changes to the config
-        self.configurator.save()
+        self.configurator.save("Changes before challenge setup", True)
 
         # Prepare the server for HTTPS
         self.configurator.prepare_server_https(
@@ -73,6 +76,7 @@ class ApacheTlsSni01(common.TLSSNI01):
 
         # Setup the configuration
         addrs = self._mod_config()
+        self.configurator.save("Don't lose mod_config changes", True)
         self.configurator.make_addrs_sni_ready(addrs)
 
         # Save reversible changes
@@ -104,6 +108,7 @@ class ApacheTlsSni01(common.TLSSNI01):
         self.configurator.reverter.register_file_creation(
             True, self.challenge_conf)
 
+        logger.debug("writing a config file with text:\n %s", config_text)
         with open(self.challenge_conf, "w") as new_conf:
             new_conf.write(config_text)
 
@@ -122,7 +127,8 @@ class ApacheTlsSni01(common.TLSSNI01):
                 addrs.add(default_addr)
             else:
                 addrs.add(
-                    addr.get_sni_addr(self.configurator.config.tls_sni_01_port))
+                    addr.get_sni_addr(
+                        self.configurator.config.tls_sni_01_port))
 
         return addrs
 
@@ -138,6 +144,8 @@ class ApacheTlsSni01(common.TLSSNI01):
         if len(self.configurator.parser.find_dir(
                 parser.case_i("Include"), self.challenge_conf)) == 0:
             # print "Including challenge virtual host(s)"
+            logger.debug("Adding Include %s to %s",
+                          self.challenge_conf, parser.get_aug_path(main_config))
             self.configurator.parser.add_dir(
                 parser.get_aug_path(main_config),
                 "Include", self.challenge_conf)

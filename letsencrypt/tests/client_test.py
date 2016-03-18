@@ -74,6 +74,23 @@ class RegisterTest(unittest.TestCase):
         self.config.email = None
         self.assertRaises(errors.Error, self._call)
 
+    @mock.patch("letsencrypt.client.logger")
+    def test_without_email(self, mock_logger):
+        with mock.patch("letsencrypt.client.acme_client.Client"):
+            with mock.patch("letsencrypt.account.report_new_account"):
+                self.config.email = None
+                self.config.register_unsafely_without_email = True
+                self._call()
+                mock_logger.warn.assert_called_once_with(mock.ANY)
+
+    def test_unsupported_error(self):
+        from acme import messages
+        msg = "Test"
+        mx_err = messages.Error(detail=msg, typ="malformed", title="title")
+        with mock.patch("letsencrypt.client.acme_client.Client") as mock_client:
+            mock_client().register.side_effect = [mx_err, mock.MagicMock()]
+            self.assertRaises(messages.Error, self._call)
+
 class ClientTest(unittest.TestCase):
     """Tests for letsencrypt.client.Client."""
 
@@ -82,6 +99,7 @@ class ClientTest(unittest.TestCase):
             no_verify_ssl=False, config_dir="/etc/letsencrypt")
         # pylint: disable=star-args
         self.account = mock.MagicMock(**{"key.pem": KEY})
+        self.eg_domains = ["example.com", "www.example.com"]
 
         from letsencrypt.client import Client
         with mock.patch("letsencrypt.client.acme_client.Client") as acme:
@@ -89,7 +107,7 @@ class ClientTest(unittest.TestCase):
             self.acme = acme.return_value = mock.MagicMock()
             self.client = Client(
                 config=self.config, account_=self.account,
-                dv_auth=None, installer=None)
+                auth=None, installer=None)
 
     def test_init_acme_verify_ssl(self):
         net = self.acme_client.call_args[1]["net"]
@@ -101,21 +119,52 @@ class ClientTest(unittest.TestCase):
         self.acme.fetch_chain.return_value = mock.sentinel.chain
 
     def _check_obtain_certificate(self):
-        self.client.auth_handler.get_authorizations.assert_called_once_with(
-            ["example.com", "www.example.com"])
+        self.client.auth_handler.get_authorizations.assert_called_once_with(self.eg_domains)
         self.acme.request_issuance.assert_called_once_with(
             jose.ComparableX509(OpenSSL.crypto.load_certificate_request(
                 OpenSSL.crypto.FILETYPE_ASN1, CSR_SAN)),
             self.client.auth_handler.get_authorizations())
         self.acme.fetch_chain.assert_called_once_with(mock.sentinel.certr)
 
-    def test_obtain_certificate_from_csr(self):
+    # FIXME move parts of this to test_cli.py...
+    @mock.patch("letsencrypt.client.logger")
+    @mock.patch("letsencrypt.cli.process_domain")
+    def test_obtain_certificate_from_csr(self, mock_process_domain, mock_logger):
         self._mock_obtain_certificate()
-        self.assertEqual(
-            (mock.sentinel.certr, mock.sentinel.chain),
-            self.client.obtain_certificate_from_csr(le_util.CSR(
-                form="der", file=None, data=CSR_SAN)))
-        self._check_obtain_certificate()
+        from letsencrypt import cli
+        test_csr = le_util.CSR(form="der", file=None, data=CSR_SAN)
+        mock_parsed_args = mock.MagicMock()
+        # The CLI should believe that this is a certonly request, because
+        # a CSR would not be allowed with other kinds of requests!
+        mock_parsed_args.verb = "certonly"
+        with mock.patch("letsencrypt.client.le_util.CSR") as mock_CSR:
+            mock_CSR.return_value = test_csr
+            mock_parsed_args.domains = self.eg_domains[:]
+            mock_parser = mock.MagicMock(cli.HelpfulArgumentParser)
+            cli.HelpfulArgumentParser.handle_csr(mock_parser, mock_parsed_args)
+
+            # make sure cli processing occurred
+            cli_processed = (call[0][1] for call in mock_process_domain.call_args_list)
+            self.assertEqual(set(cli_processed), set(("example.com", "www.example.com")))
+            # Now provoke an inconsistent domains error...
+            mock_parsed_args.domains.append("hippopotamus.io")
+            self.assertRaises(errors.ConfigurationError,
+                cli.HelpfulArgumentParser.handle_csr, mock_parser, mock_parsed_args)
+
+            self.assertEqual(
+                (mock.sentinel.certr, mock.sentinel.chain),
+                self.client.obtain_certificate_from_csr(self.eg_domains, test_csr))
+            # and that the cert was obtained correctly
+            self._check_obtain_certificate()
+
+            # Test for no auth_handler
+            self.client.auth_handler = None
+            self.assertRaises(
+                errors.Error,
+                self.client.obtain_certificate_from_csr,
+                self.eg_domains,
+                test_csr)
+            mock_logger.warning.assert_called_once_with(mock.ANY)
 
     @mock.patch("letsencrypt.client.crypto_util")
     def test_obtain_certificate(self, mock_crypto_util):
@@ -141,9 +190,9 @@ class ClientTest(unittest.TestCase):
         tmp_path = tempfile.mkdtemp()
         os.chmod(tmp_path, 0o755)  # TODO: really??
 
-        certr = mock.MagicMock(body=test_util.load_cert(certs[0]))
-        chain_cert = [test_util.load_cert(certs[1]),
-                      test_util.load_cert(certs[2])]
+        certr = mock.MagicMock(body=test_util.load_comparable_cert(certs[0]))
+        chain_cert = [test_util.load_comparable_cert(certs[1]),
+                      test_util.load_comparable_cert(certs[2])]
         candidate_cert_path = os.path.join(tmp_path, "certs", "cert.pem")
         candidate_chain_path = os.path.join(tmp_path, "chains", "chain.pem")
         candidate_fullchain_path = os.path.join(tmp_path, "chains", "fullchain.pem")
@@ -240,6 +289,7 @@ class ClientTest(unittest.TestCase):
         mock_enhancements.ask.return_value = True
         installer = mock.MagicMock()
         self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
 
         self.client.enhance_config(["foo.bar"], config)
         installer.enhance.assert_called_once_with("foo.bar", "redirect", None)
@@ -255,6 +305,7 @@ class ClientTest(unittest.TestCase):
         mock_enhancements.ask.return_value = True
         installer = mock.MagicMock()
         self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect", "ensure-http-header"]
 
         config = ConfigHelper(redirect=True, hsts=False, uir=False)
         self.client.enhance_config(["foo.bar"], config)
@@ -273,6 +324,17 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(installer.save.call_count, 3)
         self.assertEqual(installer.restart.call_count, 3)
 
+    @mock.patch("letsencrypt.client.enhancements")
+    def test_enhance_config_unsupported(self, mock_enhancements):
+        installer = mock.MagicMock()
+        self.client.installer = installer
+        installer.supported_enhancements.return_value = []
+
+        config = ConfigHelper(redirect=None, hsts=True, uir=True)
+        self.client.enhance_config(["foo.bar"], config)
+        installer.enhance.assert_not_called()
+        mock_enhancements.ask.assert_not_called()
+
     def test_enhance_config_no_installer(self):
         config = ConfigHelper(redirect=True, hsts=False, uir=False)
         self.assertRaises(errors.Error,
@@ -285,6 +347,7 @@ class ClientTest(unittest.TestCase):
         mock_enhancements.ask.return_value = True
         installer = mock.MagicMock()
         self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
         installer.enhance.side_effect = errors.PluginError
 
         config = ConfigHelper(redirect=True, hsts=False, uir=False)
@@ -301,6 +364,7 @@ class ClientTest(unittest.TestCase):
         mock_enhancements.ask.return_value = True
         installer = mock.MagicMock()
         self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
         installer.save.side_effect = errors.PluginError
 
         config = ConfigHelper(redirect=True, hsts=False, uir=False)
@@ -317,6 +381,7 @@ class ClientTest(unittest.TestCase):
         mock_enhancements.ask.return_value = True
         installer = mock.MagicMock()
         self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
         installer.restart.side_effect = [errors.PluginError, None]
 
         config = ConfigHelper(redirect=True, hsts=False, uir=False)
@@ -335,6 +400,7 @@ class ClientTest(unittest.TestCase):
         mock_enhancements.ask.return_value = True
         installer = mock.MagicMock()
         self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
         installer.restart.side_effect = errors.PluginError
         installer.rollback_checkpoints.side_effect = errors.ReverterError
 

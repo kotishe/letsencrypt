@@ -2,7 +2,6 @@
 import argparse
 import collections
 import logging
-import random
 import socket
 import threading
 
@@ -91,6 +90,9 @@ class ServerManager(object):
         logger.debug("Stopping server at %s:%d...",
                      *instance.server.socket.getsockname()[:2])
         instance.server.shutdown()
+        # Not calling server_close causes problems when renewing multiple
+        # certs with `letsencrypt renew` using TLSSNI01 and PyOpenSSL 0.13
+        instance.server.server_close()
         instance.thread.join()
         del self._instances[port]
 
@@ -108,7 +110,7 @@ class ServerManager(object):
                     in six.iteritems(self._instances))
 
 
-SUPPORTED_CHALLENGES = set([challenges.TLSSNI01, challenges.HTTP01])
+SUPPORTED_CHALLENGES = [challenges.TLSSNI01, challenges.HTTP01]
 
 
 def supported_challenges_validator(data):
@@ -133,6 +135,8 @@ def supported_challenges_validator(data):
     return data
 
 
+@zope.interface.implementer(interfaces.IAuthenticator)
+@zope.interface.provider(interfaces.IPluginFactory)
 class Authenticator(common.Plugin):
     """Standalone Authenticator.
 
@@ -141,8 +145,6 @@ class Authenticator(common.Plugin):
     challenges from the certificate authority. Therefore, it does not
     rely on any existing server program.
     """
-    zope.interface.implements(interfaces.IAuthenticator)
-    zope.interface.classProvides(interfaces.IPluginFactory)
 
     description = "Automatically use a temporary webserver"
 
@@ -151,7 +153,7 @@ class Authenticator(common.Plugin):
 
         # one self-signed key for all tls-sni-01 certificates
         self.key = OpenSSL.crypto.PKey()
-        self.key.generate_key(OpenSSL.crypto.TYPE_RSA, bits=2048)
+        self.key.generate_key(OpenSSL.crypto.TYPE_RSA, 2048)
 
         self.served = collections.defaultdict(set)
 
@@ -166,16 +168,16 @@ class Authenticator(common.Plugin):
 
     @classmethod
     def add_parser_arguments(cls, add):
-        add("supported-challenges", help="Supported challenges, "
-            "order preferences are randomly chosen.",
-            type=supported_challenges_validator, default=",".join(
-                sorted(chall.typ for chall in SUPPORTED_CHALLENGES)))
+        add("supported-challenges",
+            help="Supported challenges. Preferred in the order they are listed.",
+            type=supported_challenges_validator,
+            default=",".join(chall.typ for chall in SUPPORTED_CHALLENGES))
 
     @property
     def supported_challenges(self):
         """Challenges supported by this plugin."""
-        return set(challenges.Challenge.TYPES[name] for name in
-                   self.conf("supported-challenges").split(","))
+        return [challenges.Challenge.TYPES[name] for name in
+                self.conf("supported-challenges").split(",")]
 
     @property
     def _necessary_ports(self):
@@ -198,12 +200,11 @@ class Authenticator(common.Plugin):
 
     def get_chall_pref(self, domain):
         # pylint: disable=unused-argument,missing-docstring
-        chall_pref = list(self.supported_challenges)
-        random.shuffle(chall_pref)  # 50% for each challenge
-        return chall_pref
+        return self.supported_challenges
 
     def perform(self, achalls):  # pylint: disable=missing-docstring
-        if any(util.already_listening(port) for port in self._necessary_ports):
+        renewer = self.config.verb == "renew"
+        if any(util.already_listening(port, renewer) for port in self._necessary_ports):
             raise errors.MisconfigurationError(
                 "At least one of the (possibly) required ports is "
                 "already taken.")

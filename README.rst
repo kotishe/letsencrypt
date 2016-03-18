@@ -51,11 +51,11 @@ client will guide you through the process of obtaining and installing certs
 interactively.
 
 You can also tell it exactly what you want it to do from the command line.
-For instance, if you want to obtain a cert for ``thing.com``,
-``www.thing.com``, and ``otherthing.net``, using the Apache plugin to both
+For instance, if you want to obtain a cert for ``example.com``,
+``www.example.com``, and ``other.example.net``, using the Apache plugin to both
 obtain and install the certs, you could do this::
 
-  ./letsencrypt-auto --apache -d thing.com -d www.thing.com -d otherthing.net
+  ./letsencrypt-auto --apache -d example.com -d www.example.com -d other.example.net
 
 (The first time you run the command, it will make an account, and ask for an
 email and agreement to the Let's Encrypt Subscriber Agreement; you can
@@ -64,7 +64,7 @@ automate those with ``--email`` and ``--agree-tos``)
 If you want to use a webserver that doesn't have full plugin support yet, you
 can still use "standalone" or "webroot" plugins to obtain a certificate::
 
-  ./letsencrypt-auto certonly --standalone --email admin@thing.com -d thing.com -d www.thing.com -d otherthing.net
+  ./letsencrypt-auto certonly --standalone --email admin@example.com -d example.com -d www.example.com -d other.example.net
 
 
 Understanding the client in more depth
@@ -89,6 +89,11 @@ Main Website: https://letsencrypt.org/
 IRC Channel: #letsencrypt on `Freenode`_
 
 Community: https://community.letsencrypt.org
+
+ACME spec: http://ietf-wg-acme.github.io/acme/
+
+ACME working area in github: https://github.com/ietf-wg-acme/acme
+
 
 Mailing list: `client-dev`_ (to subscribe without a Google account, send an
 email to client-dev+subscribe@letsencrypt.org)
@@ -163,5 +168,5 @@ Current Features
 * Free and Open Source Software, made with Python.
 
 
-.. _Freenode: https://freenode.net
+.. _Freenode: https://webchat.freenode.net?channels=%23letsencrypt
 .. _client-dev: https://groups.google.com/a/letsencrypt.org/forum/#!forum/client-dev

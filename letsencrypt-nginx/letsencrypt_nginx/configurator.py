@@ -5,7 +5,6 @@ import re
 import shutil
 import socket
 import subprocess
-import sys
 import time
 
 import OpenSSL
@@ -32,6 +31,8 @@ from letsencrypt_nginx import parser
 logger = logging.getLogger(__name__)
 
 
+@zope.interface.implementer(interfaces.IAuthenticator, interfaces.IInstaller)
+@zope.interface.provider(interfaces.IPluginFactory)
 class NginxConfigurator(common.Plugin):
     # pylint: disable=too-many-instance-attributes,too-many-public-methods
     """Nginx configurator.
@@ -53,8 +54,6 @@ class NginxConfigurator(common.Plugin):
     :ivar tup version: version of Nginx
 
     """
-    zope.interface.implements(interfaces.IAuthenticator, interfaces.IInstaller)
-    zope.interface.classProvides(interfaces.IPluginFactory)
 
     description = "Nginx Web Server - currently doesn't work"
 
@@ -106,10 +105,17 @@ class NginxConfigurator(common.Plugin):
 
     # This is called in determine_authenticator and determine_installer
     def prepare(self):
-        """Prepare the authenticator/installer."""
+        """Prepare the authenticator/installer.
+
+        :raises .errors.NoInstallationError: If Nginx ctl cannot be found
+        :raises .errors.MisconfigurationError: If Nginx is misconfigured
+        """
         # Verify Nginx is installed
         if not le_util.exe_exists(self.conf('ctl')):
             raise errors.NoInstallationError
+
+        # Make sure configuration is valid
+        self.config_test()
 
         self.parser = parser.NginxParser(
             self.conf('server-root'), self.mod_ssl_conf)
@@ -122,7 +128,7 @@ class NginxConfigurator(common.Plugin):
 
     # Entry point in main.py for installing cert
     def deploy_cert(self, domain, cert_path, key_path,
-                    chain_path, fullchain_path):
+                    chain_path=None, fullchain_path=None):
         # pylint: disable=unused-argument
         """Deploys certificate to specified virtual host.
 
@@ -136,7 +142,15 @@ class NginxConfigurator(common.Plugin):
 
         .. note:: This doesn't save the config files!
 
+        :raises errors.PluginError: When unable to deploy certificate due to
+            a lack of directives or configuration
+
         """
+        if not fullchain_path:
+            raise errors.PluginError(
+                "The nginx plugin currently requires --fullchain-path to "
+                "install a cert.")
+
         vhost = self.choose_vhost(domain)
         cert_directives = [['ssl_certificate', fullchain_path],
                            ['ssl_certificate_key', key_path]]
@@ -149,6 +163,12 @@ class NginxConfigurator(common.Plugin):
                 ['ssl_trusted_certificate', chain_path],
                 ['ssl_stapling', 'on'],
                 ['ssl_stapling_verify', 'on']]
+
+        if len(stapling_directives) != 0 and not chain_path:
+            raise errors.PluginError(
+                "--chain-path is required to enable "
+                "Online Certificate Status Protocol (OCSP) stapling "
+                "on nginx >= 1.3.7.")
 
         try:
             self.parser.add_server_directives(vhost.filep, vhost.names,
@@ -168,8 +188,14 @@ class NginxConfigurator(common.Plugin):
         self.save_notes += ("Changed vhost at %s with addresses of %s\n" %
                             (vhost.filep,
                              ", ".join(str(addr) for addr in vhost.addrs)))
-        self.save_notes += "\tssl_certificate %s\n" % cert_path
+        self.save_notes += "\tssl_certificate %s\n" % fullchain_path
         self.save_notes += "\tssl_certificate_key %s\n" % key_path
+        if len(stapling_directives) > 0:
+            self.save_notes += "\tssl_trusted_certificate %s\n" % chain_path
+            self.save_notes += "\tssl_stapling on\n"
+            self.save_notes += "\tssl_stapling_verify on\n"
+
+
 
     #######################
     # Vhost parsing methods
@@ -219,6 +245,7 @@ class NginxConfigurator(common.Plugin):
 
     def _get_ranked_matches(self, target_name):
         """Returns a ranked list of vhosts that match target_name.
+        The ranking gives preference to SSL vhosts.
 
         :param str target_name: The name to match
         :returns: list of dicts containing the vhost, the matching name, and
@@ -289,10 +316,10 @@ class NginxConfigurator(common.Plugin):
         key = OpenSSL.crypto.load_privatekey(
             OpenSSL.crypto.FILETYPE_PEM, le_key.pem)
         cert = acme_crypto_util.gen_ss_cert(key, domains=[socket.gethostname()])
-        cert_path = os.path.join(tmp_dir, "cert.pem")
         cert_pem = OpenSSL.crypto.dump_certificate(
             OpenSSL.crypto.FILETYPE_PEM, cert)
-        with open(cert_path, 'w') as cert_file:
+        cert_file, cert_path = le_util.unique_file(os.path.join(tmp_dir, "cert.pem"))
+        with cert_file:
             cert_file.write(cert_pem)
         return cert_path, le_key.file
 
@@ -311,17 +338,11 @@ class NginxConfigurator(common.Plugin):
         """
         snakeoil_cert, snakeoil_key = self._get_snakeoil_paths()
         ssl_block = [['listen', '{0} ssl'.format(self.config.tls_sni_01_port)],
-                     # access and error logs necessary for integration
-                     # testing (non-root)
-                     ['access_log', os.path.join(
-                         self.config.work_dir, 'access.log')],
-                     ['error_log', os.path.join(
-                         self.config.work_dir, 'error.log')],
                      ['ssl_certificate', snakeoil_cert],
                      ['ssl_certificate_key', snakeoil_key],
                      ['include', self.parser.loc["ssl_options"]]]
         self.parser.add_server_directives(
-            vhost.filep, vhost.names, ssl_block)
+            vhost.filep, vhost.names, ssl_block, replace=False)
         vhost.ssl = True
         vhost.raw.extend(ssl_block)
         vhost.addrs.add(obj.Addr(
@@ -384,7 +405,7 @@ class NginxConfigurator(common.Plugin):
             [['return', '301 https://$host$request_uri']]
         ]]
         self.parser.add_server_directives(
-            vhost.filep, vhost.names, redirect_block)
+            vhost.filep, vhost.names, redirect_block, replace=False)
         logger.info("Redirecting all traffic to ssl in %s", vhost.filep)
 
     ######################################
@@ -393,35 +414,21 @@ class NginxConfigurator(common.Plugin):
     def restart(self):
         """Restarts nginx server.
 
-        :returns: Success
-        :rtype: bool
+        :raises .errors.MisconfigurationError: If either the reload fails.
 
         """
-        return nginx_restart(self.conf('ctl'), self.nginx_conf)
+        nginx_restart(self.conf('ctl'), self.nginx_conf)
 
     def config_test(self):  # pylint: disable=no-self-use
         """Check the configuration of Nginx for errors.
 
-        :returns: Success
-        :rtype: bool
+        :raises .errors.MisconfigurationError: If config_test fails
 
         """
         try:
-            proc = subprocess.Popen(
-                [self.conf('ctl'), "-c", self.nginx_conf, "-t"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate()
-        except (OSError, ValueError):
-            logger.fatal("Unable to run nginx config test")
-            sys.exit(1)
-
-        if proc.returncode != 0:
-            # Enter recovery routine...
-            logger.error("Config test failed\n%s\n%s", stdout, stderr)
-            return False
-
-        return True
+            le_util.run_script([self.conf('ctl'), "-c", self.nginx_conf, "-t"])
+        except errors.SubprocessError as err:
+            raise errors.MisconfigurationError(str(err))
 
     def _verify_setup(self):
         """Verify the setup to ensure safe operating environment.
@@ -511,21 +518,33 @@ class NginxConfigurator(common.Plugin):
         :param bool temporary: Indicates whether the changes made will
             be quickly reversed in the future (ie. challenges)
 
+        :raises .errors.PluginError: If there was an error in
+            an attempt to save the configuration, or an error creating a
+            checkpoint
+
         """
         save_files = set(self.parser.parsed.keys())
 
-        # Create Checkpoint
-        if temporary:
-            self.reverter.add_to_temp_checkpoint(
-                save_files, self.save_notes)
-        else:
-            self.reverter.add_to_checkpoint(save_files,
+        try:
+            # Create Checkpoint
+            if temporary:
+                self.reverter.add_to_temp_checkpoint(
+                    save_files, self.save_notes)
+            else:
+                self.reverter.add_to_checkpoint(save_files,
                                             self.save_notes)
+        except errors.ReverterError as err:
+            raise errors.PluginError(str(err))
+
+        self.save_notes = ""
 
         # Change 'ext' to something else to not override existing conf files
         self.parser.filedump(ext='')
         if title and not temporary:
-            self.reverter.finalize_checkpoint(title)
+            try:
+                self.reverter.finalize_checkpoint(title)
+            except errors.ReverterError as err:
+                raise errors.PluginError(str(err))
 
         return True
 
@@ -534,13 +553,25 @@ class NginxConfigurator(common.Plugin):
 
         Reverts all modified files that have not been saved as a checkpoint
 
+        :raises .errors.PluginError: If unable to recover the configuration
+
         """
-        self.reverter.recovery_routine()
+        try:
+            self.reverter.recovery_routine()
+        except errors.ReverterError as err:
+            raise errors.PluginError(str(err))
         self.parser.load()
 
     def revert_challenge_config(self):
-        """Used to cleanup challenge configurations."""
-        self.reverter.revert_temporary_config()
+        """Used to cleanup challenge configurations.
+
+        :raises .errors.PluginError: If unable to revert the challenge config.
+
+        """
+        try:
+            self.reverter.revert_temporary_config()
+        except errors.ReverterError as err:
+            raise errors.PluginError(str(err))
         self.parser.load()
 
     def rollback_checkpoints(self, rollback=1):
@@ -548,13 +579,27 @@ class NginxConfigurator(common.Plugin):
 
         :param int rollback: Number of checkpoints to revert
 
+        :raises .errors.PluginError: If there is a problem with the input or
+            the function is unable to correctly revert the configuration
+
         """
-        self.reverter.rollback_checkpoints(rollback)
+        try:
+            self.reverter.rollback_checkpoints(rollback)
+        except errors.ReverterError as err:
+            raise errors.PluginError(str(err))
         self.parser.load()
 
     def view_config_changes(self):
-        """Show all of the configuration changes that have taken place."""
-        self.reverter.view_config_changes()
+        """Show all of the configuration changes that have taken place.
+
+        :raises .errors.PluginError: If there is a problem while processing
+            the checkpoints directories.
+
+        """
+        try:
+            self.reverter.view_config_changes()
+        except errors.ReverterError as err:
+            raise errors.PluginError(str(err))
 
     ###########################################################################
     # Challenges Section for IAuthenticator
@@ -631,18 +676,15 @@ def nginx_restart(nginx_ctl, nginx_conf="/etc/nginx.conf"):
 
             if nginx_proc.returncode != 0:
                 # Enter recovery routine...
-                logger.error("Nginx Restart Failed!\n%s\n%s", stdout, stderr)
-                return False
+                raise errors.MisconfigurationError(
+                    "nginx restart failed:\n%s\n%s" % (stdout, stderr))
 
     except (OSError, ValueError):
-        logger.fatal("Nginx Restart Failed - Please Check the Configuration")
-        sys.exit(1)
+        raise errors.MisconfigurationError("nginx restart failed")
     # Nginx can take a moment to recognize a newly added TLS SNI servername, so sleep
     # for a second. TODO: Check for expected servername and loop until it
     # appears or return an error if looping too long.
     time.sleep(1)
-
-    return True
 
 
 def temp_install(options_ssl):
